@@ -1,50 +1,127 @@
+from typing import List, Tuple, Optional, Set
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from typing import List, Optional, Dict, Any
+import pickle
 import os
 import io
-import pickle
-import logging
-from datetime import datetime
 from app.core.config import get_settings
-from app.models.document import DocumentCreate, DocumentResponse
+from app.models.document import DocumentResponse
+import logging
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
+# Google Workspace MIME types and their export formats
+GOOGLE_MIME_TYPES = {
+    'application/vnd.google-apps.document': 'application/pdf',
+    'application/vnd.google-apps.spreadsheet': 'application/pdf',
+    'application/vnd.google-apps.presentation': 'application/pdf',
+    'application/vnd.google-apps.drawing': 'application/pdf',
+}
+
+# Common document MIME types
+DEFAULT_MIME_TYPES = [
+    # Documents
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/msword',
+    'application/vnd.google-apps.document',
+    'text/plain',
+    'text/csv',
+    'application/rtf',
+    
+    # Spreadsheets
+    'application/vnd.google-apps.spreadsheet',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.ms-excel',
+    
+    # Presentations
+    'application/vnd.google-apps.presentation',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.ms-powerpoint',
+    
+    # Images
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/tiff',
+    'image/bmp',
+    'image/webp'
+]
+
+FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder'
+
 class GoogleDriveService:
     def __init__(self):
-        self.credentials = self._get_credentials()
-        self.service = build('drive', 'v3', credentials=self.credentials)
-        
+        self.creds = self._get_credentials()
+        self.service = build('drive', 'v3', credentials=self.creds)
+
     def _get_credentials(self) -> Credentials:
-        """Get or refresh Google Drive credentials"""
-        credentials = None
-        
-        # Try to load existing token
+        """Get valid credentials for Google Drive API"""
+        creds = None
         if os.path.exists(settings.GOOGLE_DRIVE_TOKEN_FILE):
             with open(settings.GOOGLE_DRIVE_TOKEN_FILE, 'rb') as token:
-                credentials = pickle.load(token)
-        
-        # If credentials are expired or don't exist, refresh or create new ones
-        if not credentials or not credentials.valid:
-            if credentials and credentials.expired and credentials.refresh_token:
-                credentials.refresh(Request())
+                creds = pickle.load(token)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     settings.GOOGLE_DRIVE_CREDENTIALS_FILE, SCOPES)
-                credentials = flow.run_local_server(port=0)
-            
-            # Save credentials for future use
+                creds = flow.run_local_server(port=0)
             with open(settings.GOOGLE_DRIVE_TOKEN_FILE, 'wb') as token:
-                pickle.dump(credentials, token)
-        
-        return credentials
+                pickle.dump(creds, token)
+
+        return creds
+
+    async def _list_folder_contents(self, folder_id: str, recursive: bool = False) -> List[str]:
+        """List all file IDs in a folder, including subfolders if recursive"""
+        try:
+            query = f"'{folder_id}' in parents and mimeType != '{FOLDER_MIME_TYPE}'"
+            results = self.service.files().list(
+                q=query,
+                fields="files(id, mimeType)",
+                pageSize=1000
+            ).execute()
+            
+            file_ids = [item['id'] for item in results.get('files', [])]
+            
+            if recursive:
+                # Get subfolders
+                folder_query = f"'{folder_id}' in parents and mimeType = '{FOLDER_MIME_TYPE}'"
+                folder_results = self.service.files().list(
+                    q=folder_query,
+                    fields="files(id)",
+                    pageSize=1000
+                ).execute()
+                
+                # Recursively get files from subfolders
+                for folder in folder_results.get('files', []):
+                    subfolder_files = await self._list_folder_contents(folder['id'], recursive=True)
+                    file_ids.extend(subfolder_files)
+                    
+            return file_ids
+            
+        except Exception as e:
+            logger.error(f"Error listing folder contents: {e}", exc_info=True)
+            raise
+
+    async def _get_file_details(self, file_id: str) -> Optional[dict]:
+        """Get detailed information for a single file"""
+        try:
+            return self.service.files().get(
+                fileId=file_id,
+                fields="id, name, mimeType, createdTime, modifiedTime, size, description"
+            ).execute()
+        except Exception as e:
+            logger.error(f"Error getting file details for {file_id}: {e}")
+            return None
 
     async def list_files(
         self,
@@ -52,104 +129,91 @@ class GoogleDriveService:
         mime_types: Optional[List[str]] = None,
         recursive: bool = False
     ) -> List[DocumentResponse]:
-        """List files in the specified Google Drive folder"""
+        """List files from Google Drive"""
         try:
-            folder_id = folder_id or settings.GOOGLE_DRIVE_FOLDER_ID
-            query_parts = [
-                f"'{folder_id}' in parents",
-                "trashed = false"
-            ]
+            # Get all file IDs from the folder and subfolders
+            if folder_id or settings.GOOGLE_DRIVE_FOLDER_ID:
+                target_folder = folder_id or settings.GOOGLE_DRIVE_FOLDER_ID
+                file_ids = await self._list_folder_contents(target_folder, recursive)
+                if not file_ids:
+                    logger.warning(f"No files found in folder {target_folder}")
+                    return []
+            else:
+                return []
+
+            # Use default mime types if none specified
+            mime_types_to_use = set(mime_types if mime_types else DEFAULT_MIME_TYPES)
             
-            if mime_types:
-                mime_type_query = " or ".join([f"mimeType='{mt}'" for mt in mime_types])
-                query_parts.append(f"({mime_type_query})")
-            
-            query = " and ".join(query_parts)
-            
-            fields = "files(id, name, mimeType, createdTime, modifiedTime, size, webViewLink, thumbnailLink, parents)"
-            
-            results = []
-            page_token = None
-            
-            while True:
-                response = self.service.files().list(
-                    q=query,
-                    spaces='drive',
-                    fields=fields,
-                    pageToken=page_token
-                ).execute()
-                
-                for file in response.get('files', []):
-                    doc_response = DocumentResponse(
+            # Get details for each file and filter by mime type
+            documents = []
+            for file_id in file_ids:
+                file = await self._get_file_details(file_id)
+                if file and file['mimeType'] in mime_types_to_use:
+                    doc = DocumentResponse(
                         id=file['id'],
                         title=file['name'],
-                        mime_type=file['mimeType'],
                         drive_id=file['id'],
-                        parent_folder_id=file.get('parents', [None])[0],
-                        created_at=datetime.fromisoformat(file['createdTime'].replace('Z', '+00:00')),
-                        updated_at=datetime.fromisoformat(file['modifiedTime'].replace('Z', '+00:00')),
-                        size=file.get('size'),
-                        web_view_link=file.get('webViewLink'),
-                        thumbnail_link=file.get('thumbnailLink'),
-                        metadata={}
+                        mime_type=file['mimeType'],
+                        created_at=file['createdTime'],
+                        updated_at=file['modifiedTime'],
+                        metadata={
+                            'size': file.get('size'),
+                            'description': file.get('description'),
+                            'is_google_workspace': file['mimeType'] in GOOGLE_MIME_TYPES,
+                            'export_format': GOOGLE_MIME_TYPES.get(file['mimeType'])
+                        }
                     )
-                    results.append(doc_response)
-                
-                page_token = response.get('nextPageToken')
-                if not page_token:
-                    break
-                
-            if recursive:
-                # Get subfolders
-                folder_query = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed = false"
-                folders = self.service.files().list(
-                    q=folder_query,
-                    spaces='drive',
-                    fields='files(id)'
-                ).execute()
-                
-                # Recursively get files from subfolders
-                for folder in folders.get('files', []):
-                    subfolder_files = await self.list_files(
-                        folder_id=folder['id'],
-                        mime_types=mime_types,
-                        recursive=True
-                    )
-                    results.extend(subfolder_files)
+                    documents.append(doc)
+                    logger.info(f"Added document: {doc.title} ({doc.mime_type})")
             
-            return results
+            return documents
             
         except Exception as e:
             logger.error(f"Error listing files from Google Drive: {e}", exc_info=True)
             raise
 
-    async def download_file(self, file_id: str) -> tuple[bytes, str]:
+    async def download_file(self, file_id: str, original_mime_type: str = None) -> Tuple[bytes, str]:
         """Download a file from Google Drive"""
         try:
-            file_metadata = self.service.files().get(fileId=file_id).execute()
-            request = self.service.files().get_media(fileId=file_id)
-            
-            file_handle = io.BytesIO()
-            downloader = MediaIoBaseDownload(file_handle, request)
-            
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            
-            return file_handle.getvalue(), file_metadata.get('mimeType', '')
-            
-        except Exception as e:
-            logger.error(f"Error downloading file from Google Drive: {e}", exc_info=True)
-            raise
-
-    async def get_file_metadata(self, file_id: str) -> Dict[str, Any]:
-        """Get metadata for a specific file"""
-        try:
-            return self.service.files().get(
+            # Get file metadata first
+            file_metadata = self.service.files().get(
                 fileId=file_id,
-                fields='id, name, mimeType, createdTime, modifiedTime, size, webViewLink, thumbnailLink, parents'
+                fields='mimeType'
             ).execute()
             
+            mime_type = file_metadata.get('mimeType')
+            
+            # Skip folders
+            if mime_type == FOLDER_MIME_TYPE:
+                logger.warning(f"Attempted to download a folder: {file_id}")
+                raise ValueError("Cannot download a folder")
+                
+            file_content = io.BytesIO()
+
+            # Use original_mime_type if provided
+            if original_mime_type in GOOGLE_MIME_TYPES:
+                logger.info(f"Exporting Google Workspace file {file_id} as {GOOGLE_MIME_TYPES[original_mime_type]}")
+                # Export Google Workspace files
+                export_mime_type = GOOGLE_MIME_TYPES[original_mime_type]
+                request = self.service.files().export_media(
+                    fileId=file_id,
+                    mimeType=export_mime_type
+                )
+                downloader = MediaIoBaseDownload(file_content, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return file_content.getvalue(), export_mime_type
+            else:
+                logger.info(f"Downloading regular file {file_id} ({mime_type})")
+                # Download regular files
+                request = self.service.files().get_media(fileId=file_id)
+                downloader = MediaIoBaseDownload(file_content, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return file_content.getvalue(), mime_type
+
         except Exception as e:
-            logger.error(f"Error getting file metadata from Google Drive: {e}", exc_info=True)
+            logger.error(f"Error downloading file from Google Drive: {e}", exc_info=True)
             raise 

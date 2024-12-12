@@ -1,14 +1,18 @@
 from typing import List, Optional, Dict, Any
 from llama_index.core import (
     VectorStoreIndex,
-    ServiceContext,
     StorageContext,
     load_index_from_storage,
+    Document
 )
 from llama_index.vector_stores.azureaisearch import AzureAISearchVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core.settings import Settings
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
 from app.core.config import get_settings
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -17,10 +21,23 @@ class SearchService:
     def __init__(self):
         self.index_name = settings.AZURE_SEARCH_INDEX_NAME or "llm-search-index"
         
-        self.vector_store = AzureAISearchVectorStore(
-            azure_search_endpoint=settings.AZURE_SEARCH_SERVICE_ENDPOINT,
-            azure_search_key=settings.AZURE_SEARCH_ADMIN_KEY,
+        # Create Azure Search client
+        credential = AzureKeyCredential(settings.AZURE_SEARCH_ADMIN_KEY)
+        self.search_client = SearchClient(
+            endpoint=settings.AZURE_SEARCH_SERVICE_ENDPOINT,
             index_name=self.index_name,
+            credential=credential
+        )
+        
+        # Initialize vector store with required parameters
+        self.vector_store = AzureAISearchVectorStore(
+            search_or_index_client=self.search_client,
+            id_field_key="id",
+            chunk_field_key="chunk",
+            embedding_field_key="embedding",
+            metadata_string_field_key="metadata",
+            doc_id_field_key="doc_id",
+            vector_field_key="vector",
             index_creation_params={
                 "vector_search_dimensions": 1536,
                 "semantic_search_config": "default",
@@ -32,7 +49,7 @@ class SearchService:
                         "searchable": True
                     },
                     {
-                        "name": "document_id",
+                        "name": "doc_id",
                         "type": "Edm.String",
                         "filterable": True,
                         "searchable": True
@@ -46,10 +63,11 @@ class SearchService:
             }
         )
         
+        # Configure llama-index settings
         self.embed_model = OpenAIEmbedding(api_key=settings.OPENAI_API_KEY)
-        self.service_context = ServiceContext.from_defaults(
-            embed_model=self.embed_model,
-        )
+        Settings.embed_model = self.embed_model
+        Settings.chunk_size = 1024
+        Settings.chunk_overlap = 20
         
         self.storage_context = StorageContext.from_defaults(
             vector_store=self.vector_store
@@ -58,7 +76,6 @@ class SearchService:
         try:
             self.index = load_index_from_storage(
                 storage_context=self.storage_context,
-                service_context=self.service_context,
             )
         except Exception as e:
             logger.info(f"Creating new index '{self.index_name}': {e}")
@@ -105,16 +122,29 @@ class SearchService:
         Update the search index with new documents
         """
         try:
+            # Convert dictionaries to Document objects
+            llama_docs = []
+            for doc in documents:
+                # Convert metadata to string to ensure it's serializable
+                metadata_str = json.dumps(doc["metadata"])
+                
+                # Create Document object
+                llama_doc = Document(
+                    text=doc["text"],
+                    metadata={"metadata_str": metadata_str},
+                    id_=doc["metadata"]["document_id"]  # Use document_id as the unique identifier
+                )
+                llama_docs.append(llama_doc)
+            
             # Create new index if it doesn't exist
             if not self.index:
                 self.index = VectorStoreIndex.from_documents(
-                    documents,
+                    llama_docs,
                     storage_context=self.storage_context,
-                    service_context=self.service_context,
                 )
             else:
                 # Update existing index
-                for doc in documents:
+                for doc in llama_docs:
                     self.index.insert(doc)
                     
             logger.info(f"Successfully updated index with {len(documents)} documents")

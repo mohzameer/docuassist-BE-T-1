@@ -7,7 +7,7 @@ from docx import Document
 from PIL import Image
 import pytesseract
 from app.models.document import DocumentResponse
-from app.services.google_drive_service import GoogleDriveService
+from app.services.google_drive_service import GoogleDriveService, GOOGLE_MIME_TYPES
 from app.services.search_service import SearchService
 from app.models.batch import BatchProcessingStatus
 import uuid
@@ -24,7 +24,12 @@ SUPPORTED_MIME_TYPES = {
     'image/jpeg',
     'image/png',
     'image/gif',
-    'image/tiff'
+    'image/tiff',
+    # Add Google Workspace MIME types
+    'application/vnd.google-apps.document',
+    'application/vnd.google-apps.spreadsheet',
+    'application/vnd.google-apps.presentation',
+    'application/vnd.google-apps.drawing',
 }
 
 class DocumentService:
@@ -62,14 +67,24 @@ class DocumentService:
     ) -> tuple[Optional[str], Dict[str, Any]]:
         """Process a single document based on its mime type"""
         try:
-            file_content, mime_type = await self.drive_service.download_file(document.drive_id)
-            
+            # Skip unsupported file types
+            if document.mime_type not in SUPPORTED_MIME_TYPES:
+                logger.warning(f"Unsupported mime type: {document.mime_type} for document {document.id}")
+                return None, {"error": "Unsupported file type"}
+
             # Initialize metadata
             metadata = {
                 "processed_timestamp": str(datetime.utcnow()),
-                "original_mime_type": mime_type,
+                "original_mime_type": document.mime_type,
+                "is_google_workspace": document.mime_type in GOOGLE_MIME_TYPES
             }
 
+            # Download and process the file
+            file_content, mime_type = await self.drive_service.download_file(
+                document.drive_id,
+                original_mime_type=document.mime_type
+            )
+            
             # Process based on mime type
             if mime_type.startswith('text/'):
                 content = file_content.decode('utf-8')
@@ -86,7 +101,7 @@ class DocumentService:
                 metadata['image_processed'] = True
                 
             else:
-                logger.warning(f"Unsupported mime type: {mime_type} for document {document.id}")
+                logger.warning(f"Unsupported processed mime type: {mime_type} for document {document.id}")
                 return None, metadata
 
             return content, metadata
