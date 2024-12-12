@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+.venv
+.python-version
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+*.log
+logs/
+log/
+
+# Google Drive credentials
+google_credentials/
+credentials.json
+token.pickle
+*.json
+!package.json
+
+# Azure credentials
+azure_credentials/
+*.azureauth
+
+# Test coverage
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Database
+*.db
+*.sqlite3
+*.sqlite
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Environment files
+.env
+.env.local
+.env.*.local
+config/*.env
+!config/example.env
+!config/template.env
+
+# Documentation
+docs/_build/
+site/
+
+# Deployment
+*.pem
+*.key
+*.crt
+*.csr
+*.cert
+
+# OS specific
+.DS_Store
+Thumbs.db 

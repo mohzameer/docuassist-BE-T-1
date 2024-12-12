@@ -1,0 +1,34 @@
+llm_search_backend/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── config.py
+│   │   ├── security.py
+│   │   └── logging_config.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── v1/
+│   │   │   ├── __init__.py
+│   │   │   ├── endpoints/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── search.py
+│   │   │   │   └── documents.py
+│   │   │   └── router.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── search_service.py
+│   │   ├── document_service.py
+│   │   └── google_drive_service.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── document.py
+│   │   └── search.py
+│   └── utils/
+│       ├── __init__.py
+│       └── helpers.py
+├── tests/
+├── alembic/
+├── logs/
+└── requirements.txt 
