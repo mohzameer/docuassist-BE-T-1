@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # LlamaIndex
     OPENAI_API_KEY: str
     
+    # Search Configuration
+    AZURE_SEARCH_SCORE_THRESHOLD: float = 0.7
+    AZURE_SEARCH_K_MULTIPLIER: int = 2
+    AZURE_SEARCH_ENABLE_RERANKING: bool = True
+    AZURE_SEARCH_ENABLE_SEMANTIC: bool = True
+    
     class Config:
         env_file = ".env"
         case_sensitive = True

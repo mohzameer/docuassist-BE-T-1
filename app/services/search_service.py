@@ -130,6 +130,63 @@ class SearchService:
             logger.error(f"Error ensuring index exists: {e}", exc_info=True)
             raise
 
+    async def _rerank_results(self, query: str, results: List[dict]) -> List[dict]:
+        """Rerank results using LLM to improve relevance"""
+        if not settings.AZURE_SEARCH_ENABLE_RERANKING:
+            return results
+
+        try:
+            rerank_prompt = f"""Given the search query: "{query}"
+            Rate how relevant each result is on a scale of 0-1, where 1 is most relevant.
+            Consider semantic meaning, not just keyword matches.
+            Return only the numeric score.
+            
+            Content to rate: {{content}}
+            Relevance score:"""
+            
+            reranked = []
+            for result in results:
+                chat_completion = await self.openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a relevance scoring assistant. Respond only with a number between 0 and 1."},
+                        {"role": "user", "content": rerank_prompt.format(content=result["content"][:1000])}
+                    ],
+                    temperature=0.3
+                )
+                
+                try:
+                    llm_score = float(chat_completion.choices[0].message.content.strip())
+                    result["score"] = (result.get("score", 0) + llm_score) / 2  # Combine scores
+                except ValueError:
+                    continue
+                    
+                reranked.append(result)
+                
+            return sorted(reranked, key=lambda x: x["score"], reverse=True)
+        except Exception as e:
+            logger.error(f"Error in reranking: {e}")
+            return results
+
+    def _get_semantic_window(self, content: str, query: str, window_size: int = 3) -> str:
+        """Get semantic window around the most relevant part of the content"""
+        sentences = content.split('. ')
+        if len(sentences) <= window_size:
+            return content
+            
+        best_score = 0
+        best_window = content
+        
+        for i in range(len(sentences) - window_size + 1):
+            window = '. '.join(sentences[i:i + window_size])
+            # Simple relevance scoring
+            score = sum(1 for word in query.lower().split() if word in window.lower())
+            if score > best_score:
+                best_score = score
+                best_window = window
+                
+        return best_window
+
     async def search(
         self,
         query: str,
@@ -141,10 +198,10 @@ class SearchService:
         Perform vector search with optional summarization
         """
         try:
-            # Generate embedding for the query
+            # Generate embedding with context
             embedding_response = await self.openai_client.embeddings.create(
                 model="text-embedding-ada-002",
-                input=query
+                input=f"Search query for document retrieval: {query}"  # Add context
             )
             vector = embedding_response.data[0].embedding
 
@@ -153,14 +210,19 @@ class SearchService:
                 "count": True,
                 "top": limit,
                 "select": "content,embedding,metadata,document_id",
+                "search": query if settings.AZURE_SEARCH_ENABLE_SEMANTIC else None,
+                "queryType": "semantic" if settings.AZURE_SEARCH_ENABLE_SEMANTIC else "simple",
+                "searchMode": "all",
+                "semanticConfiguration": "default-config" if settings.AZURE_SEARCH_ENABLE_SEMANTIC else None,
                 "vectorQueries": [
                     {
                         "kind": "vector",
                         "vector": vector,
                         "fields": "embedding",
-                        "k": limit
+                        "k": limit * settings.AZURE_SEARCH_K_MULTIPLIER
                     }
-                ]
+                ],
+                "vectorFilterMode": "preFilter" if settings.AZURE_SEARCH_ENABLE_SEMANTIC else None
             }
 
             # Add filters if provided
@@ -185,7 +247,6 @@ class SearchService:
                 'Accept': 'application/json'
             }
             
-            # Add API version to URL
             search_url = f"{settings.AZURE_SEARCH_SERVICE_ENDPOINT}/indexes/{self.index_name}/docs/search?api-version=2023-11-01"
             
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
@@ -202,11 +263,16 @@ class SearchService:
             processed_results = []
             for result in search_results.get('value', []):
                 try:
-                    print("result")
-                    print(result)
-                    print("-------")
+                    score = result.get("@search.score", 0)
+                    # Apply score threshold
+                    if score < settings.AZURE_SEARCH_SCORE_THRESHOLD:
+                        continue
+
                     metadata = json.loads(result.get("metadata", "{}"))
                     content = result.get("content", "")
+
+                    # Get semantic window around relevant content
+                    content = self._get_semantic_window(content, query)
 
                     # If summarization is requested, use LLM
                     if summarize and content:
@@ -223,18 +289,21 @@ class SearchService:
                             content = chat_completion.choices[0].message.content.strip()
                         except Exception as e:
                             logger.error(f"Error summarizing content: {e}")
-                            # Fall back to original content if summarization fails
 
                     processed_results.append({
                         "content": content,
                         "metadata": metadata,
-                        "score": result.get("@search.score"),
+                        "score": score,
                         "document_id": result.get("document_id")
                     })
 
                 except Exception as e:
                     logger.error(f"Error processing search result: {e}")
                     continue
+
+            # Rerank results if enabled
+            if processed_results and settings.AZURE_SEARCH_ENABLE_RERANKING:
+                processed_results = await self._rerank_results(query, processed_results)
 
             logger.info(f"Search query '{query}' returned {len(processed_results)} results")
             return processed_results
