@@ -11,9 +11,14 @@ import pytesseract
 from app.models.document import DocumentResponse
 from app.services.google_drive_service import GoogleDriveService, GOOGLE_MIME_TYPES
 from app.services.search_service import SearchService
-from app.models.batch import BatchProcessingStatus
+from app.models.batch import BatchProcessingStatus, BatchProcessingStats, BatchProcessingError
 import uuid
 import asyncio
+import re
+from llama_index.core import Document, Settings
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.schema import TextNode
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,12 @@ SUPPORTED_MIME_TYPES = {
     'application/vnd.google-apps.drawing',
 }
 
+settings = get_settings()
+
+# Configure LlamaIndex settings
+Settings.chunk_size = settings.CHUNK_SIZE
+Settings.chunk_overlap = settings.CHUNK_OVERLAP
+
 class DocumentService:
     def __init__(
         self,
@@ -43,6 +54,16 @@ class DocumentService:
         self.drive_service = drive_service
         self.search_service = search_service
         self._batch_status = {}
+        
+        # Initialize text splitter with LlamaIndex
+        self.text_splitter = SentenceSplitter(
+            chunk_size=settings.CHUNK_SIZE,
+            chunk_overlap=settings.CHUNK_OVERLAP,
+            paragraph_separator="\n\n",
+            secondary_chunking_regex="[^,.;]+[,.;]?",
+            include_metadata=True,
+            include_prev_next_rel=True  # Include relationships between chunks
+        )
 
     async def _process_pdf(self, file_content: bytes, filename: str) -> str:
         """Extract text from PDF file"""
@@ -157,6 +178,43 @@ class DocumentService:
             logger.error(f"Error processing document {document.title}: {str(e)}", exc_info=True)
             raise
 
+    def _chunk_text(self, text: str, metadata: Dict[str, Any]) -> List[TextNode]:
+        """
+        Split text into chunks using LlamaIndex's text splitter
+        """
+        try:
+            # Clean the text
+            text = self._clean_text(text)
+            
+            # Create a Document object with metadata
+            doc = Document(
+                text=text,
+                metadata=metadata,
+                excluded_embed_metadata_keys=["chunk_id", "chunk_index"]
+            )
+            
+            # Split into nodes
+            nodes = self.text_splitter.split_nodes([doc])
+            
+            logger.info(f"Split text into {len(nodes)} chunks")
+            return nodes
+            
+        except Exception as e:
+            logger.error(f"Error chunking text: {e}")
+            raise
+
+    def _clean_text(self, text: str) -> str:
+        """
+        Clean text before chunking
+        """
+        # Remove excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep periods and newlines
+        text = re.sub(r'[^\w\s\.\n]', '', text)
+        # Normalize newlines
+        text = re.sub(r'\n+', '\n', text)
+        return text.strip()
+
     async def process_documents(
         self,
         documents: List[DocumentResponse]
@@ -171,18 +229,34 @@ class DocumentService:
                 logger.info(f"Processing document: {document.title}")
                 content, metadata = await self._process_single_document(document)
                 if content:
-                    # Update search index
-                    await self.search_service.update_index([{
-                        "text": content,
-                        "metadata": {
-                            **metadata,
-                            "document_id": document.id,
-                            "title": document.title,
-                            "drive_id": document.drive_id
-                        }
-                    }])
+                    # Create base metadata
+                    base_metadata = {
+                        **metadata,
+                        "document_id": document.id,
+                        "title": document.title,
+                        "drive_id": document.drive_id
+                    }
+                    
+                    # Split content into nodes
+                    nodes = self._chunk_text(content, base_metadata)
+                    
+                    # Index each node
+                    for i, node in enumerate(nodes):
+                        # Add chunk-specific metadata
+                        node.metadata.update({
+                            "chunk_id": f"{document.id}_chunk_{i}",
+                            "chunk_index": i,
+                            "total_chunks": len(nodes)
+                        })
+                        
+                        # Update search index
+                        await self.search_service.update_index([{
+                            "text": node.text,
+                            "metadata": node.metadata
+                        }])
+                    
                     processed_docs.append(document)
-                    logger.info(f"Successfully indexed document: {document.title}")
+                    logger.info(f"Successfully indexed document: {document.title} ({len(nodes)} chunks)")
                 else:
                     failed_docs.append(document.title)
             except Exception as e:
@@ -204,11 +278,15 @@ class DocumentService:
         batch_id = str(uuid.uuid4())
         total = len(documents)
         
+        # Create initial status with stats
         self._batch_status[batch_id] = BatchProcessingStatus(
             batch_id=batch_id,
-            total=total,
-            processed=0,
-            status="processing"
+            status="processing",
+            stats=BatchProcessingStats(
+                total_documents=total,
+                processed_documents=0,
+                failed_documents=0
+            )
         )
         
         # Start processing in background
@@ -224,26 +302,43 @@ class DocumentService:
         """Process documents in batch"""
         try:
             for document in documents:
-                content, metadata = await self._process_single_document(document)
-                if content:
-                    await self.search_service.update_index([{
-                        "text": content,
-                        "metadata": {
-                            **metadata,
-                            "document_id": document.id,
-                            "title": document.title,
-                            "drive_id": document.drive_id
-                        }
-                    }])
-                
-                self._batch_status[batch_id].processed += 1
-                
+                try:
+                    content, metadata = await self._process_single_document(document)
+                    if content:
+                        await self.search_service.update_index([{
+                            "text": content,
+                            "metadata": {
+                                **metadata,
+                                "document_id": document.id,
+                                "title": document.title,
+                                "drive_id": document.drive_id
+                            }
+                        }])
+                        self._batch_status[batch_id].stats.processed_documents += 1
+                    else:
+                        self._batch_status[batch_id].stats.failed_documents += 1
+                        self._batch_status[batch_id].errors.append(
+                            BatchProcessingError(
+                                document_id=document.id,
+                                error_message="No content extracted"
+                            )
+                        )
+                except Exception as e:
+                    self._batch_status[batch_id].stats.failed_documents += 1
+                    self._batch_status[batch_id].errors.append(
+                        BatchProcessingError(
+                            document_id=document.id,
+                            error_message=str(e)
+                        )
+                    )
+                    
             self._batch_status[batch_id].status = "completed"
+            self._batch_status[batch_id].stats.end_time = datetime.utcnow()
             
         except Exception as e:
             logger.error(f"Batch processing error: {e}", exc_info=True)
             self._batch_status[batch_id].status = "failed"
-            self._batch_status[batch_id].error = str(e)
+            self._batch_status[batch_id].stats.end_time = datetime.utcnow()
 
     async def get_batch_status(self, batch_id: str) -> Optional[BatchProcessingStatus]:
         """Get status of a batch processing job"""

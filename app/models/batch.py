@@ -11,19 +11,19 @@ class BatchStatus(str, Enum):
 
 class BatchProcessingStats(BaseModel):
     total_documents: int
-    processed_documents: int
-    failed_documents: int
-    start_time: datetime
+    processed_documents: int = 0
+    failed_documents: int = 0
+    start_time: datetime = datetime.utcnow()
     end_time: Optional[datetime] = None
     
 class BatchProcessingError(BaseModel):
     document_id: str
     error_message: str
-    timestamp: datetime
+    timestamp: datetime = datetime.utcnow()
 
 class BatchProcessingStatus(BaseModel):
     batch_id: str
-    status: BatchStatus
+    status: str
     stats: BatchProcessingStats
     errors: List[BatchProcessingError] = []
     metadata: Dict[str, str] = {} 
