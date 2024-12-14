@@ -275,12 +275,26 @@ class SearchService:
             for result in search_results.get('value', []):
                 try:
                     logger.info(f"Processing result: {json.dumps(result, indent=2)}")
-                    score = result.get("@search.score", 0)
-                    logger.info(f"Result score: {score}, threshold: {settings.AZURE_SEARCH_SCORE_THRESHOLD}")
+                    
+                    # Get both scores
+                    vector_score = float(result.get("@search.score", 0))
+                    reranker_score = float(result.get("@search.rerankerScore", 0))
+                    
+                    logger.info(f"Vector score: {vector_score}, Reranker score: {reranker_score}")
+                    
+                    # Use reranker score if available, otherwise use vector score
+                    if reranker_score > 0:
+                        # Normalize reranker score from 0-4 to 0-1 range
+                        normalized_score = reranker_score / 4.0
+                    else:
+                        # Vector score is already in 0-1 range
+                        normalized_score = vector_score
+                    
+                    logger.info(f"Final normalized score: {normalized_score}, threshold: {settings.AZURE_SEARCH_SCORE_THRESHOLD}")
                     
                     # Apply score threshold
-                    if score < settings.AZURE_SEARCH_SCORE_THRESHOLD:
-                        logger.info(f"Skipping result due to low score: {score}")
+                    if normalized_score < settings.AZURE_SEARCH_SCORE_THRESHOLD:
+                        logger.info(f"Skipping result due to low normalized score: {normalized_score}")
                         continue
 
                     metadata = json.loads(result.get("metadata", "{}"))
@@ -308,7 +322,9 @@ class SearchService:
                     processed_results.append({
                         "content": content,
                         "metadata": metadata,
-                        "score": score,
+                        "score": normalized_score,
+                        "vector_score": vector_score,
+                        "reranker_score": reranker_score,  # Include both scores in response
                         "document_id": result.get("document_id")
                     })
 
