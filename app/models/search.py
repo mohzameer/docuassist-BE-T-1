@@ -5,7 +5,8 @@ class SearchRequest(BaseModel):
     """Search request model"""
     query: str
     filters: Optional[Dict[str, Any]] = None
-    limit: int = 10
+    limit: Optional[int] = 10
+    summarize: Optional[bool] = False
 
 class SearchResponse(BaseModel):
     """Search response model"""

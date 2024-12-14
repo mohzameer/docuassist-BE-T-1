@@ -2,16 +2,17 @@ from typing import List, Optional, Dict, Any
 from llama_index.core import (
     VectorStoreIndex,
     StorageContext,
-    load_index_from_storage,
-    Document
+    Document,
+    Settings as LlamaSettings
 )
 from llama_index.vector_stores.azureaisearch import AzureAISearchVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.core.settings import Settings
+from llama_index.llms.openai import OpenAI
 from azure.search.documents import SearchClient
 from azure.search.documents.indexes import SearchIndexClient
 from azure.core.credentials import AzureKeyCredential
 from app.core.config import get_settings
+import openai
 import requests
 import logging
 import json
@@ -23,14 +24,19 @@ class SearchService:
     def __init__(self):
         self.index_name = settings.AZURE_SEARCH_INDEX_NAME or "documents-index"
         
+        # Configure OpenAI settings
+        openai.api_key = settings.OPENAI_API_KEY
+        
         # Create Azure Search clients
         self.credential = AzureKeyCredential(settings.AZURE_SEARCH_ADMIN_KEY)
+        
+        # Create index client
         self.index_client = SearchIndexClient(
             endpoint=settings.AZURE_SEARCH_SERVICE_ENDPOINT,
             credential=self.credential
         )
         
-        # Ensure index exists
+        # Ensure index exists before creating search client
         self._ensure_index_exists()
         
         # Create search client
@@ -40,7 +46,19 @@ class SearchService:
             credential=self.credential
         )
         
-        # Initialize vector store
+        # Configure embeddings model
+        self.embed_model = OpenAIEmbedding(api_key=settings.OPENAI_API_KEY)
+        
+        # Configure LLM
+        self.llm = OpenAI(api_key=settings.OPENAI_API_KEY, model="gpt-3.5-turbo")
+        
+        # Configure global settings
+        LlamaSettings.embed_model = self.embed_model
+        LlamaSettings.llm = self.llm
+        LlamaSettings.chunk_size = 1024
+        LlamaSettings.chunk_overlap = 20
+        
+        # Initialize vector store with search client
         self.vector_store = AzureAISearchVectorStore(
             search_or_index_client=self.search_client,
             id_field_key="id",
@@ -48,26 +66,22 @@ class SearchService:
             embedding_field_key="vector",
             metadata_string_field_key="metadata",
             doc_id_field_key="doc_id",
-            vector_field_key="vector",
+            vector_field_key="vector"
         )
         
-        # Configure llama-index settings
-        self.embed_model = OpenAIEmbedding(api_key=settings.OPENAI_API_KEY)
-        Settings.embed_model = self.embed_model
-        Settings.chunk_size = 1024
-        Settings.chunk_overlap = 20
-        
+        # Initialize storage context
         self.storage_context = StorageContext.from_defaults(
             vector_store=self.vector_store
         )
         
-        try:
-            self.index = load_index_from_storage(
-                storage_context=self.storage_context,
-            )
-        except Exception as e:
-            logger.info(f"Creating new index '{self.index_name}': {e}")
-            self.index = None
+        # Create index object
+        self.index = VectorStoreIndex.from_vector_store(
+            vector_store=self.vector_store,
+            embed_model=self.embed_model,
+            llm=self.llm,
+            show_progress=True
+        )
+        logger.info(f"Initialized index: {self.index_name}")
 
     def _ensure_index_exists(self):
         """Create the search index if it doesn't exist"""
@@ -155,41 +169,88 @@ class SearchService:
                     raise Exception(f"Failed to create index: {response.text}")
                     
                 logger.info(f"Successfully created index: {self.index_name}")
+            else:
+                logger.info(f"Using existing index: {self.index_name}")
                 
         except Exception as e:
             logger.error(f"Error ensuring index exists: {e}", exc_info=True)
             raise
 
-    async def hybrid_search(
+    async def search(
         self,
         query: str,
         filters: Optional[Dict[str, Any]] = None,
-        limit: int = 10
+        limit: int = 10,
+        summarize: bool = False
     ) -> List[Dict[str, Any]]:
         """
-        Perform hybrid search using both vector and keyword search
+        Perform search with optional LLM-powered summarization
         """
         try:
+            # Check if index exists and has been initialized
+            if not self.index:
+                logger.warning("Search index is not initialized. No documents have been indexed yet.")
+                return []
+            
+            # Convert filters to OData filter string for Azure Search
+            filter_str = None
+            if filters:
+                filter_conditions = []
+                for key, value in filters.items():
+                    if isinstance(value, (list, tuple)):
+                        or_conditions = [f"{key} eq '{v}'" for v in value]
+                        filter_conditions.append(f"({' or '.join(or_conditions)})")
+                    else:
+                        filter_conditions.append(f"{key} eq '{value}'")
+                if filter_conditions:
+                    filter_str = " and ".join(filter_conditions)
+                logger.debug(f"Created filter string: {filter_str}")
+            
             # Create query engine
             query_engine = self.index.as_query_engine(
                 similarity_top_k=limit,
-                filters=filters,
+                vector_store_kwargs={
+                    "filter": filter_str,
+                    "search_client": self.search_client
+                } if filter_str else {
+                    "search_client": self.search_client
+                }
             )
             
             # Execute search
+            logger.debug(f"Executing search with query: {query}")
             response = await query_engine.aquery(query)
             
             # Process and format results
             results = []
             for node in response.source_nodes:
+                # Parse metadata string back to dictionary
+                try:
+                    metadata = json.loads(node.metadata.get("metadata_str", "{}"))
+                except json.JSONDecodeError:
+                    metadata = node.metadata
+                
+                content = node.text
+                
+                # If summarization is requested, use LLM to summarize the content
+                if summarize and content:
+                    try:
+                        summary_prompt = f"Please summarize the following text concisely:\n\n{content}\n\nSummary:"
+                        summary_response = await self.llm.acomplete(summary_prompt)
+                        content = summary_response.text.strip()
+                    except Exception as e:
+                        logger.error(f"Error summarizing content: {e}")
+                        # Fall back to original content if summarization fails
+                
                 result = {
-                    "content": node.text,
-                    "metadata": node.metadata,
+                    "content": content,
+                    "metadata": metadata,
                     "score": node.score if hasattr(node, 'score') else None,
                     "document_id": node.node_id,
                 }
                 results.append(result)
             
+            logger.info(f"Search query '{query}' returned {len(results)} results")
             return results
             
         except Exception as e:
@@ -217,12 +278,14 @@ class SearchService:
             
             # Create new index if it doesn't exist
             if not self.index:
+                logger.info("Creating new VectorStoreIndex")
                 self.index = VectorStoreIndex.from_documents(
                     llama_docs,
                     storage_context=self.storage_context,
                 )
             else:
                 # Update existing index
+                logger.info(f"Updating existing index with {len(documents)} documents")
                 for doc in llama_docs:
                     self.index.insert(doc)
                     
