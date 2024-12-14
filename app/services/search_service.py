@@ -187,13 +187,50 @@ class SearchService:
                 
         return best_window
 
+    async def _generate_answer(self, query: str, results: List[dict]) -> str:
+        """Generate a specific answer to the query using the retrieved content"""
+        try:
+            # Combine relevant content with appropriate context
+            context = "\n\n".join([
+                f"Document {i+1}:\n{result['content']}" 
+                for i, result in enumerate(results[:3])  # Use top 3 results
+            ])
+
+            prompt = f"""Based on the following documents, answer the query: "{query}"
+            
+            Context from documents:
+            {context}
+
+            Instructions:
+            1. Provide a direct and specific answer to the query
+            2. Use information only from the provided documents
+            3. If the documents don't contain enough information to answer the query, say so
+            4. Cite which document(s) you used for the answer
+
+            Answer:"""
+
+            chat_completion = await self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that provides accurate answers based on given documents."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            return chat_completion.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Error generating answer: {e}")
+            return None
+
     async def search(
         self,
         query: str,
         filters: Optional[Dict[str, Any]] = None,
         limit: int = 10,
         summarize: bool = False
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
         Perform vector search with optional summarization
         """
@@ -337,7 +374,16 @@ class SearchService:
                 processed_results = await self._rerank_results(query, processed_results)
 
             logger.info(f"Final processed results count: {len(processed_results)}")
-            return processed_results
+
+            # Generate answer from results
+            answer = await self._generate_answer(query, processed_results)
+
+            # Return both answer and supporting documents
+            return {
+                "answer": answer,
+                "documents": processed_results,
+                "total_results": len(processed_results)
+            }
 
         except Exception as e:
             logger.error(f"Search error: {e}", exc_info=True)

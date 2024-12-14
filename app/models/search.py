@@ -8,9 +8,17 @@ class SearchRequest(BaseModel):
     limit: Optional[int] = 10
     summarize: Optional[bool] = False
 
-class SearchResponse(BaseModel):
-    """Search response model"""
+class DocumentResponse(BaseModel):
+    """Individual document response"""
     content: str
     metadata: Dict[str, Any]
-    score: Optional[float] = None
-    document_id: str 
+    score: float
+    vector_score: float
+    reranker_score: float
+    document_id: str
+
+class SearchResponse(BaseModel):
+    """Search response model"""
+    answer: Optional[str]
+    documents: List[DocumentResponse]
+    total_results: int 

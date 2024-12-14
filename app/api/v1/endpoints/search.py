@@ -8,11 +8,11 @@ import logging
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-@router.post("/search", response_model=List[SearchResponse])
+@router.post("/search", response_model=SearchResponse)
 async def search(
     request: SearchRequest,
     search_service: SearchService = Depends(get_search_service)
-) -> List[SearchResponse]:
+) -> SearchResponse:
     """
     Search documents with optional filters and summarization
     """
