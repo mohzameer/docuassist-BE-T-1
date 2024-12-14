@@ -249,23 +249,38 @@ class SearchService:
             
             search_url = f"{settings.AZURE_SEARCH_SERVICE_ENDPOINT}/indexes/{self.index_name}/docs/search?api-version=2023-11-01"
             
+            # Log the full request for debugging
+            logger.info(f"Search URL: {search_url}")
+            logger.info(f"Search headers: {headers}")
+            logger.info(f"Search request body: {json.dumps(search_request, indent=2)}")
+            
             connector = aiohttp.TCPConnector(ssl=self.ssl_context)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(search_url, headers=headers, json=search_request) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"Search request failed: {error_text}")
-                        raise Exception(f"Search request failed: {error_text}")
+                    response_text = await response.text()
+                    logger.info(f"Search response status: {response.status}")
+                    logger.info(f"Search response body: {response_text}")
                     
-                    search_results = await response.json()
+                    if response.status != 200:
+                        logger.error(f"Search request failed: {response_text}")
+                        raise Exception(f"Search request failed: {response_text}")
+                    
+                    search_results = json.loads(response_text)
+
+            # Log the number of results
+            logger.info(f"Raw search results count: {len(search_results.get('value', []))}")
 
             # Process results
             processed_results = []
             for result in search_results.get('value', []):
                 try:
+                    logger.info(f"Processing result: {json.dumps(result, indent=2)}")
                     score = result.get("@search.score", 0)
+                    logger.info(f"Result score: {score}, threshold: {settings.AZURE_SEARCH_SCORE_THRESHOLD}")
+                    
                     # Apply score threshold
                     if score < settings.AZURE_SEARCH_SCORE_THRESHOLD:
+                        logger.info(f"Skipping result due to low score: {score}")
                         continue
 
                     metadata = json.loads(result.get("metadata", "{}"))
@@ -305,7 +320,7 @@ class SearchService:
             if processed_results and settings.AZURE_SEARCH_ENABLE_RERANKING:
                 processed_results = await self._rerank_results(query, processed_results)
 
-            logger.info(f"Search query '{query}' returned {len(processed_results)} results")
+            logger.info(f"Final processed results count: {len(processed_results)}")
             return processed_results
 
         except Exception as e:
