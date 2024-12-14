@@ -2,9 +2,11 @@ from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 import logging
 import io
+import os
+import tempfile
 import PyPDF2
 from docx import Document
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import pytesseract
 from app.models.document import DocumentResponse
 from app.services.google_drive_service import GoogleDriveService, GOOGLE_MIME_TYPES
@@ -42,72 +44,117 @@ class DocumentService:
         self.search_service = search_service
         self._batch_status = {}
 
-    async def _process_pdf(self, file_content: bytes) -> str:
+    async def _process_pdf(self, file_content: bytes, filename: str) -> str:
         """Extract text from PDF file"""
+        logger.info(f"Processing PDF file: {filename}")
         pdf_file = io.BytesIO(file_content)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         text = ""
-        for page in pdf_reader.pages:
+        for page_num, page in enumerate(pdf_reader.pages, 1):
+            logger.debug(f"Processing page {page_num} of {filename}")
             text += page.extract_text() + "\n"
         return text
 
-    async def _process_docx(self, file_content: bytes) -> str:
+    async def _process_docx(self, file_content: bytes, filename: str) -> str:
         """Extract text from DOCX file"""
+        logger.info(f"Processing DOCX file: {filename}")
         doc = Document(io.BytesIO(file_content))
         return "\n".join([paragraph.text for paragraph in doc.paragraphs])
 
-    async def _process_image(self, file_content: bytes) -> str:
+    async def _process_image(self, file_content: bytes, filename: str) -> str:
         """Extract text from image using OCR"""
-        image = Image.open(io.BytesIO(file_content))
-        return pytesseract.image_to_string(image)
+        logger.info(f"Processing image file: {filename}")
+        try:
+            # Create a temporary file to save the image
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+                try:
+                    # Open image from bytes
+                    with Image.open(io.BytesIO(file_content)) as image:
+                        logger.debug(f"Image format: {image.format}, Mode: {image.mode}, Size: {image.size}")
+                        
+                        # Convert image to RGB mode if necessary
+                        if image.mode not in ('L', 'RGB'):
+                            logger.debug(f"Converting image mode from {image.mode} to RGB")
+                            image = image.convert('RGB')
+                        
+                        # Save the image as PNG
+                        image.save(temp_file.name, 'PNG')
+                        logger.debug(f"Saved temporary image: {temp_file.name}")
+                    
+                    # Use pytesseract to extract text
+                    text = pytesseract.image_to_string(temp_file.name)
+                    extracted_text = text.strip()
+                    logger.debug(f"Extracted {len(extracted_text)} characters from image")
+                    return extracted_text
+                    
+                finally:
+                    # Clean up the temporary file
+                    try:
+                        os.unlink(temp_file.name)
+                        logger.debug(f"Cleaned up temporary file: {temp_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up temporary file for {filename}: {e}")
+            
+        except UnidentifiedImageError:
+            logger.error(f"Could not identify image format for file: {filename}")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing image {filename}: {str(e)}")
+            raise
 
     async def _process_single_document(
         self,
         document: DocumentResponse
     ) -> tuple[Optional[str], Dict[str, Any]]:
         """Process a single document based on its mime type"""
+        logger.info(f"Processing document: {document.title} (ID: {document.id}, Type: {document.mime_type})")
+        
         try:
             # Skip unsupported file types
             if document.mime_type not in SUPPORTED_MIME_TYPES:
-                logger.warning(f"Unsupported mime type: {document.mime_type} for document {document.id}")
+                logger.warning(f"Skipping unsupported file: {document.title} (Type: {document.mime_type})")
                 return None, {"error": "Unsupported file type"}
 
             # Initialize metadata
             metadata = {
                 "processed_timestamp": str(datetime.utcnow()),
                 "original_mime_type": document.mime_type,
-                "is_google_workspace": document.mime_type in GOOGLE_MIME_TYPES
+                "is_google_workspace": document.mime_type in GOOGLE_MIME_TYPES,
+                "title": document.title
             }
 
             # Download and process the file
+            logger.info(f"Downloading file: {document.title}")
             file_content, mime_type = await self.drive_service.download_file(
                 document.drive_id,
                 original_mime_type=document.mime_type
             )
             
-            # Process based on mime type
-            if mime_type.startswith('text/'):
-                content = file_content.decode('utf-8')
+            try:
+                # Process based on mime type
+                if mime_type == 'application/pdf':
+                    content = await self._process_pdf(file_content, document.title)
+                elif mime_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword']:
+                    content = await self._process_docx(file_content, document.title)
+                elif mime_type.startswith('image/'):
+                    content = await self._process_image(file_content, document.title)
+                else:
+                    logger.warning(f"Unsupported mime type for processing: {document.title} (Type: {mime_type})")
+                    return None, {"error": f"Unsupported mime type: {mime_type}"}
                 
-            elif mime_type == 'application/pdf':
-                content = await self._process_pdf(file_content)
+                if not content:
+                    logger.warning(f"No content extracted from document: {document.title}")
+                    return None, {"error": "No content extracted"}
                 
-            elif mime_type in ['application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                             'application/msword']:
-                content = await self._process_docx(file_content)
+                logger.info(f"Successfully processed document: {document.title} ({len(content)} characters extracted)")
+                return content, metadata
                 
-            elif mime_type.startswith('image/'):
-                content = await self._process_image(file_content)
-                metadata['image_processed'] = True
+            except Exception as e:
+                logger.error(f"Error processing document {document.title}: {str(e)}", exc_info=True)
+                raise
                 
-            else:
-                logger.warning(f"Unsupported processed mime type: {mime_type} for document {document.id}")
-                return None, metadata
-
-            return content, metadata
-
         except Exception as e:
-            logger.error(f"Error processing document {document.id}: {e}", exc_info=True)
+            logger.error(f"Error processing document {document.title}: {str(e)}", exc_info=True)
             raise
 
     async def process_documents(
@@ -115,22 +162,37 @@ class DocumentService:
         documents: List[DocumentResponse]
     ) -> List[DocumentResponse]:
         """Process multiple documents and update search index"""
+        logger.info(f"Starting batch processing of {len(documents)} documents")
         processed_docs = []
+        failed_docs = []
         
         for document in documents:
-            content, metadata = await self._process_single_document(document)
-            if content:
-                # Update search index
-                await self.search_service.update_index([{
-                    "text": content,
-                    "metadata": {
-                        **metadata,
-                        "document_id": document.id,
-                        "title": document.title,
-                        "drive_id": document.drive_id
-                    }
-                }])
-                processed_docs.append(document)
+            try:
+                logger.info(f"Processing document: {document.title}")
+                content, metadata = await self._process_single_document(document)
+                if content:
+                    # Update search index
+                    await self.search_service.update_index([{
+                        "text": content,
+                        "metadata": {
+                            **metadata,
+                            "document_id": document.id,
+                            "title": document.title,
+                            "drive_id": document.drive_id
+                        }
+                    }])
+                    processed_docs.append(document)
+                    logger.info(f"Successfully indexed document: {document.title}")
+                else:
+                    failed_docs.append(document.title)
+            except Exception as e:
+                failed_docs.append(document.title)
+                logger.error(f"Failed to process document {document.title}: {str(e)}")
+                continue
+        
+        logger.info(f"Batch processing completed. Processed: {len(processed_docs)}, Failed: {len(failed_docs)}")
+        if failed_docs:
+            logger.info(f"Failed documents: {', '.join(failed_docs)}")
         
         return processed_docs
 
