@@ -72,6 +72,13 @@ class SearchService:
                             "searchable": True
                         },
                         {
+                            "name": "title",
+                            "type": "Edm.String",
+                            "searchable": True,
+                            "filterable": True,
+                            "sortable": True
+                        },
+                        {
                             "name": "embedding",
                             "type": "Collection(Edm.Single)",
                             "searchable": True,
@@ -246,7 +253,7 @@ class SearchService:
             search_request = {
                 "count": True,
                 "top": limit,
-                "select": "content,embedding,metadata,document_id",
+                "select": "content,embedding,metadata,document_id,title",
                 "search": query if settings.AZURE_SEARCH_ENABLE_SEMANTIC else None,
                 "queryType": "semantic" if settings.AZURE_SEARCH_ENABLE_SEMANTIC else "simple",
                 "searchMode": "all",
@@ -394,25 +401,34 @@ class SearchService:
         Update the search index with new documents
         """
         try:
-            # Prepare documents for indexing
             index_documents = []
             for doc in documents:
-                # Generate embedding for the document
-                embedding_response = await self.openai_client.embeddings.create(
-                    model="text-embedding-ada-002",
-                    input=doc["text"]
-                )
-                vector = embedding_response.data[0].embedding
+                try:
+                    text_to_embed = str(doc["text"]).strip()
+                    if not text_to_embed:
+                        logger.warning(f"Empty text for document {doc['metadata'].get('document_id')}")
+                        continue
 
-                # Create document for indexing
-                index_doc = {
-                    "id": doc["metadata"]["document_id"],
-                    "content": doc["text"],
-                    "embedding": vector,
-                    "metadata": json.dumps(doc["metadata"]),
-                    "document_id": doc["metadata"]["document_id"]
-                }
-                index_documents.append(index_doc)
+                    embedding_response = await self.openai_client.embeddings.create(
+                        input=text_to_embed,
+                        model="text-embedding-ada-002",
+                        encoding_format="float"
+                    )
+                    vector = embedding_response.data[0].embedding
+
+                    # Create document for indexing with title
+                    index_doc = {
+                        "id": doc["metadata"]["document_id"],
+                        "content": text_to_embed,
+                        "title": doc["metadata"].get("title", ""),  # Add title
+                        "embedding": vector,
+                        "metadata": json.dumps(doc["metadata"]),
+                        "document_id": doc["metadata"]["document_id"]
+                    }
+                    index_documents.append(index_doc)
+                except Exception as e:
+                    logger.error(f"Error processing document for indexing: {e}")
+                    continue
 
             # Upload documents in batches
             batch_size = 50
